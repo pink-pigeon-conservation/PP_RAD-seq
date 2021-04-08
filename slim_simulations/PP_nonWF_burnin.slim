@@ -1,0 +1,186 @@
+initialize() {
+	
+	if (exists("slimgui"))
+	{
+		defineConstant("del_domCoef", 0.5); // irrelevant as h is taken from formula
+		defineConstant("del_selCoef", -0.014); // deleterious mutations DFE - mean of gamma distriubtion
+		defineConstant("del_shape", 0.14); // deleterious mutations DFE - shape of gamma distriubtion
+				
+		// path of demography file
+		defineConstant("demo_file_path", "PP_nonWF_final_demoHistory_goodOne_YEAR2200.txt");
+		
+		// path of genomic feature file
+		defineConstant("coord_file_in","coords_SLiM_GCF_000247815.1_FicAlb1.5_chr23.txt");
+		// path of recombination map file
+		defineConstant("rho_file_in","out_rho4Ne_win2e+05_col.hun.snpPair_runALL_chr23.txt");
+		
+		// set seed
+		defineConstant("seed", 887536488272);
+		
+		// prefix of the output file
+		defineConstant("outPref_in", "prefix");
+		
+		defineConstant("mu", 4.828e-08); //  mutation rate
+	}
+	
+	// Intilialize
+	initializeSLiMModelType("nonWF");
+	initializeSLiMOptions(keepPedigrees=T);
+	initializeTreeSeq(simplificationInterval=1000);
+	
+	// mutation types
+	initializeMutationType("m1", 0.5, "f", 0.0);         // non-coding
+	initializeMutationType("m2", asFloat(del_domCoef), "g", asFloat(del_selCoef), asFloat(del_shape));  // deleterious
+	
+	// intial population size
+	defineConstant("K", 16000);
+	
+	// litter size prob distribution - wild
+	defineConstant("prob_litter",c(rep(0,100),rpois(900,4.8))); // revised distribution May 2020
+	// litter size prob distribution - captive
+	defineConstant("prob_litter_p2",c(rep(0,40),rpois(960,5.8))); // revised distribution May 2020
+	
+	// exon, introns and non coding coordinates and rho
+	coord_file = readFile(coord_file_in);
+	rho_file = readFile(rho_file_in);
+	// lenght of chr = last position of rho file
+	defineConstant("chromLen", asInteger(strsplit(coord_file[length(coord_file)-1],"\t")[4]));
+	defineConstant("seqLength", chromLen);
+	
+	initializeGenomicElementType("g1", c(m1,m2), c(0,2.31));  // exon
+	initializeGenomicElementType("g2", c(m1,m2), c(0,0.2));       // intron
+	initializeGenomicElementType("g3", c(m1), c(1));       // intron
+	
+	
+	// proportion of delterious mutations relative to neutral mutation in introns and exons
+	mu_deleterious_intron=(20*mu)/100;
+	mu_deleterious_exon=(69*mu)/100;
+	
+	// define initializeGenomicElement and define mutation rates for intron, exons and intergenic
+	mu_rates=c();
+	mu_ends=c();
+	for (coord_line in coord_file)
+	{
+		ROW = strsplit(coord_line, "\t");
+		feature = ROW[2];
+		
+		if(feature=="exon") {
+			initializeGenomicElement(g1, asInteger(ROW[3]), asInteger(ROW[4]));
+			mu_rates=c(mu_rates,mu_deleterious_exon);
+			mu_ends=c(mu_ends,asInteger(ROW[4]));
+		}
+		
+		if(feature=="intron") {
+			initializeGenomicElement(g2, asInteger(ROW[3]), asInteger(ROW[4]));
+			mu_rates=c(mu_rates,mu_deleterious_intron);
+			mu_ends=c(mu_ends,asInteger(ROW[4]));
+		
+		}
+		if(feature=="non_coding") {
+			initializeGenomicElement(g3, asInteger(ROW[3]), asInteger(ROW[4]));
+			mu_rates=c(mu_rates,0);
+			mu_ends=c(mu_ends,asInteger(ROW[4]));
+		}
+	
+	}
+	
+	// init mutation rates
+	initializeMutationRate(mu_rates, mu_ends);
+	
+	// recombination rate landscape
+	rates = NULL;
+	ends = NULL;
+	
+	for (rho_line in rho_file)
+	{
+		components = strsplit(rho_line, "\t");
+		ends = c(ends, asInteger(components[2]));
+		rates = c(rates, asFloat(components[7]));
+	}
+	
+	defineConstant("recomb_ends", ends);
+	defineConstant("recomb_rates", rates);
+	initializeRecombinationRate(rates, ends);
+	
+	// set seed
+	setSeed(asInteger(seed));
+
+}
+
+//// Add intial population of age classes 0-15
+1 early() {
+	sim.addSubpop("p1", K);
+	p1.individuals.age = rdunif(K, min=0, max=15);
+	defineConstant("initGen", sim.generation);
+	p1.tag=K;
+}
+
+/// Print progress
+1: late() {
+	if(sim.generation == 1 | sim.generation % 100 ==0){
+		print(date() + "\t" + time() + "\t" + "generation: " + sim.generation + "\t" + "N: " + p1.individualCount);
+	}
+}
+
+
+//// vary dominance coefficients according to empirical evidence in yeast (Agrawal & Whitlock 2011), as implemented in Kyriazis et al. (2019) and Henn et al. (2016) 
+mutation(m2,p1) {
+	mut.setValue("dom", (0.5/(1+7071.07*(mut.selectionCoeff*-1))));
+	return T;
+}
+fitness(m2,p1) {
+	if (homozygous)
+		return 1.0 + mut.selectionCoeff;
+	else
+		return 1.0 + mut.getValue("dom") * mut.selectionCoeff;
+}
+
+
+//reproduction age restrictions + litter size - monogamous mating
+reproduction(p1) {
+	// randomize the order of p1.individuals
+	parents_age1plus=p1.individuals[p1.individuals.age>=2];
+	parents = sample(parents_age1plus, length(parents_age1plus));
+	// draw monogamous pairs and generate litters
+	if(length(parents)>=4){
+		for (i in seq(0, length(parents_age1plus) - 2, by=2))
+		{
+			parent1 = parents[i];
+			parent2 = parents[i + 1];
+			litterSize = sample(prob_litter,1);
+			for (j in 1:litterSize)
+			{
+				p1.addCrossed(parent1, parent2);
+			}
+		}
+	}
+	// disable this callback for this generation
+	self.active = 0;
+}
+
+//// Fitness scalling regulated with a life table based individual mortality
+early() {
+	inds = p1.individuals;
+	ages = inds.age;
+	prob_mort=c(rnorm(1,0.54,0.05),sort(rnorm(12,0.148,0.06)),rnorm(1,0.5,0.05), rnorm(1,0.75,0.05), 1.0);
+	prob_mort[prob_mort<0]=0;
+	mortality = prob_mort[ages];
+	survival = 1 - mortality;
+	inds.fitnessScaling = survival;
+	// density-dependence, factoring in individual mortality
+	p1.fitnessScaling = p1.tag / (p1.individualCount * mean(survival));
+}
+
+
+50000 late() {
+	indv=p1.sampleIndividuals(200);
+	m=indv.uniqueMutationsOfType(m2);
+	mS=m.selectionCoeff;
+	mH=m.getValue("dom");
+	out=sim.generation+"\t"+ mS +"\t"+ mH;
+	writeFile(outPref_in+"_m2_hs.txt",out,append=T); // to confir the hs relationship hold
+	sim.treeSeqOutput(path=paste(c(outPref_in,"_",sim.generation,"_Output.trees"),sep=""));
+	print(c(date(),time(),"simulation finished at GEN=",sim.generation,"with N=",p1.individuals.size()));
+	
+	sim.simulationFinished();
+}

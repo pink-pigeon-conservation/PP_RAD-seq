@@ -1,0 +1,603 @@
+initialize() {
+	
+	if (exists("slimgui"))
+	{
+		defineConstant("del_domCoef", 0.5); // irrelevant as h is taken from formula
+		defineConstant("del_selCoef", -0.014); // deleterious mutations DFE - mean of gamma distriubtion
+		defineConstant("del_shape", 0.14); // deleterious mutations DFE - shape of gamma distriubtion
+				
+		// path of demography file
+		defineConstant("demo_file_path", "PP_nonWF_final_demoHistory_goodOne_YEAR2200.txt");
+		
+		// path of genomic feature file
+		defineConstant("coord_file_in","coords_SLiM_GCF_000247815.1_FicAlb1.5_chr23.txt");
+		// path of recombination map file
+		defineConstant("rho_file_in","out_rho4Ne_win2e+05_col.hun.snpPair_runALL_chr23.txt");
+		
+		// path input file
+		defineConstant("input_file","PATH");
+		// set seed
+		defineConstant("seed", 887536488272);
+		
+		// prefix of the output file
+		defineConstant("outPref_in", "prefix");
+		
+		defineConstant("mu", 4.828e-08); //  mutation rate
+
+		defineConstant("supMode", "Y"); // supplementation mode Y; yes / N; no
+		defineConstant("mng_captive", 1);
+		// 1 = nothing
+		// 2 = nothing + no growth
+		
+
+// The combination of supMode and mng_captive determines the Management scenarios
+
+		//Genetic rescue = Y and 1
+		//No growth scenario  = N and 2
+		//Demographic rescue scenario  = N and 1
+
+	}
+
+	// Intilialize
+	initializeSLiMModelType("nonWF");
+	initializeSLiMOptions(keepPedigrees=T);
+	initializeTreeSeq(simplificationInterval=1000);
+	
+	// mutation types
+	initializeMutationType("m1", 0.5, "f", 0.0);         // non-coding
+	initializeMutationType("m2", asFloat(del_domCoef), "g", asFloat(del_selCoef), asFloat(del_shape));  // deleterious
+	
+	// intial population size
+	defineConstant("K", 16000);
+	
+	// litter size prob distribution - wild
+	defineConstant("prob_litter",c(rep(0,100),rpois(900,4.8))); // revised distribution May 2020
+	// litter size prob distribution - captive
+	defineConstant("prob_litter_p2",c(rep(0,40),rpois(960,5.8))); // revised distribution May 2020
+	
+	// exon, introns and non coding coordinates and rho
+	coord_file = readFile(coord_file_in);
+	rho_file = readFile(rho_file_in);
+	// lenght of chr = last position of rho file
+	defineConstant("chromLen", asInteger(strsplit(coord_file[length(coord_file)-1],"\t")[4]));
+	defineConstant("seqLength", chromLen);
+	
+	initializeGenomicElementType("g1", c(m1,m2), c(0,2.31));  // exon
+	initializeGenomicElementType("g2", c(m1,m2), c(0,0.2));       // intron
+	initializeGenomicElementType("g3", c(m1), c(1));       // intron
+	
+	
+	// proportion of delterious mutations relative to neutral mutation in introns and exons
+	mu_deleterious_intron=(20*mu)/100;
+	mu_deleterious_exon=(69*mu)/100;
+	
+	// define initializeGenomicElement and define mutation rates for intron, exons and intergenic
+	mu_rates=c();
+	mu_ends=c();
+	for (coord_line in coord_file)
+	{
+		ROW = strsplit(coord_line, "\t");
+		feature = ROW[2];
+		
+		if(feature=="exon") {
+			initializeGenomicElement(g1, asInteger(ROW[3]), asInteger(ROW[4]));
+			mu_rates=c(mu_rates,mu_deleterious_exon);
+			mu_ends=c(mu_ends,asInteger(ROW[4]));
+		}
+		
+		if(feature=="intron") {
+			initializeGenomicElement(g2, asInteger(ROW[3]), asInteger(ROW[4]));
+			mu_rates=c(mu_rates,mu_deleterious_intron);
+			mu_ends=c(mu_ends,asInteger(ROW[4]));
+		
+		}
+		if(feature=="non_coding") {
+			initializeGenomicElement(g3, asInteger(ROW[3]), asInteger(ROW[4]));
+			mu_rates=c(mu_rates,0);
+			mu_ends=c(mu_ends,asInteger(ROW[4]));
+		}
+	
+	}
+	
+	// init mutation rates
+	initializeMutationRate(mu_rates, mu_ends);
+	
+	// recombination rate landscape
+	rates = NULL;
+	ends = NULL;
+	
+	for (rho_line in rho_file)
+	{
+		components = strsplit(rho_line, "\t");
+		ends = c(ends, asInteger(components[2]));
+		rates = c(rates, asFloat(components[7]));
+	}
+	
+	defineConstant("recomb_ends", ends);
+	defineConstant("recomb_rates", rates);
+	initializeRecombinationRate(rates, ends);
+	
+	// set seed
+	setSeed(asInteger(seed));
+
+	// set mng_captive_6_cutOff
+	defineConstant("mng_captive_6_cutOff", 0.5);
+}
+
+
+//// Add intial population of age classes 0-15
+1 early() {
+	sim.readFromPopulationFile(input_file);
+	defineConstant("initGen", sim.generation);
+	p1.tag=K;
+	print("Pop file loaded:" + asString(input_file));
+	print(date() + "\t" + time() + "\t" + sim.generation+ "\t" + p1.individualCount + "\t" + mean(p1.individuals.countOfMutationsOfType(m2)));
+}
+
+/// Print progress
+1: late() {
+	if(sim.generation % 100 ==0){
+		print(date() + "\t" + time() + "\t" + "generation: " + sim.generation + "\t" + "N: " + p1.individualCount);
+	}
+}
+
+
+//// vary dominance coefficients according to empirical evidence in yeast (Agrawal & Whitlock 2011), as implemented in Kyriazis et al. (2019) and Henn et al. (2016) 
+/// need to recalculate fitness based on this hs
+
+//// recalculate fitness
+1 late() {
+	recalculateFitness();
+}
+
+//// add dominance coeff
+1 early() {
+	M2mut=sim.mutationsOfType(m2);
+	for(i in M2mut){
+		i.setValue("dom", (0.5/(1+7071.07*(i.selectionCoeff*-1))));
+	}
+}
+
+//// vary dominance coefficients
+mutation(m2,p1) {
+	mut.setValue("dom", (0.5/(1+7071.07*(mut.selectionCoeff*-1))));
+	return T;
+}
+fitness(m2,p1) {
+	if (homozygous)
+		return 1.0 + mut.selectionCoeff;
+	else
+		return 1.0 + mut.getValue("dom") * mut.selectionCoeff;
+}
+
+
+//// vary dominance coefficients
+mutation(m2,p2) {
+	mut.setValue("dom", (0.5/(1+7071.07*(mut.selectionCoeff*-1))));
+	return T;
+}
+fitness(m2,p2) {
+	if (homozygous)
+		return 1.0 + mut.selectionCoeff;
+	else
+		return 1.0 + mut.getValue("dom") * mut.selectionCoeff;
+}
+
+
+/// Schedule blocks for outputing stats and for finsishing the simulation
+1 {
+	MAX=max(1:(length(demo_file)-1));
+	MAX=demo_file[MAX];
+	LAST_gen=asInteger(strsplit(MAX,"\t")[2])+asInteger(initGen)+(genBurnin-1);
+	FIRST_gen_x=asInteger(strsplit(demo_file[1],"\t")[2])+asInteger(initGen)+(genBurnin-1);
+	FIRST_year_x=asInteger(strsplit(demo_file[1],"\t")[0]);
+	defineConstant("FIRST_gen",FIRST_gen_x);
+	defineConstant("FIRST_year",FIRST_year_x);
+	defineConstant("LAST_gen_var",LAST_gen);
+	sim.rescheduleScriptBlock(block=s0,start=LAST_gen,end=LAST_gen);
+	for (i in 1:(length(demo_file)-1)){
+		line=demo_file[i];
+		GEN=strsplit(line,"\t")[2];
+		GEN=asInteger(GEN)+asInteger(initGen)+(genBurnin-1);
+		Ne=asInteger(strsplit(line,"\t")[1]);
+		YEAR=asInteger(strsplit(line,"\t")[0]);
+		if(YEAR==1773){defineConstant("gen_y1773",GEN);}
+		if(YEAR==1900){defineConstant("gen_y1900",GEN);}
+		if(YEAR==1950){defineConstant("gen_y1950",GEN);}
+		if(YEAR==1970){defineConstant("gen_y1970",GEN);}
+	}
+	sim.deregisterScriptBlock(self);
+}
+
+//// Vary p1 pop size based on demo file
+1: {
+	for (i in 1:(length(demo_file)-1)){
+		line=demo_file[i];
+		GEN=strsplit(line,"\t")[2];
+		GEN=asInteger(GEN)+asInteger(initGen)+(genBurnin-1);
+		// vary N of wild population depends on scenario of demographic growth
+		if(asInteger(mng_captive)!=2){Ne=asInteger(strsplit(line,"\t")[1]);}
+		if(asInteger(mng_captive)==2){Ne=asInteger(strsplit(line,"\t")[7]);}
+		if(sim.generation==GEN){
+			p1.tag=Ne; // this defines the K for p1
+		}
+	}
+}
+
+//// IF supplementation = Y, then create captive population from p1, add migrants, and growth it
+2: early() {
+	if(supMode=="Y"){
+		MAX=max(1:(length(demo_file)-1));
+		MAX_gen_line=demo_file[MAX];
+		MAX_gen=asInteger(strsplit(MAX_gen_line,"\t")[2])+asInteger(initGen)+(genBurnin-1);
+		for (i in 1:(length(demo_file)-1)){
+			line=demo_file[i];
+			GEN=strsplit(line,"\t")[2];
+			GEN=asInteger(GEN)+asInteger(initGen)+(genBurnin-1);
+			Captive=asString(strsplit(line,"\t")[3]);
+			Captive_Nchange=asString(strsplit(line,"\t")[4]);
+			// foundation of p2
+			if(Captive=="Foundation" & sim.generation==GEN){
+				sim.addSubpop("p2", 1);
+				p2.takeMigrants(sample(p1.individuals,4));
+				p2.tag = 6;
+				print(c(sim.generation,GEN,"p2 foundation, p2N= ",p2.individualCount));
+			}
+			// migrants of p1 to p2
+			if(Captive=="CaptiveGrow" & sim.generation==GEN){
+				p2.takeMigrants(sample(p1.individuals,2));
+				p2.tag = p2.tag+8;
+				print(c(sim.generation,GEN,"migration to captive pop, p2N= ",p2.individualCount));
+			}
+			// p2 size increases
+			if(Captive_Nchange!="NA" & sim.generation==GEN){
+				Captive_N=asInteger(strsplit(line,"\t")[4]);
+				p2.tag = Captive_N;
+				print(c(sim.generation,GEN,"Captive_Nchange",Captive_N," p2N= ",p2.individualCount));
+			}
+			// p2 constant size
+			if(sim.generation>=MAX_gen){
+				MAX_gen_N=asInteger(strsplit(MAX_gen_line,"\t")[4]);
+				p2.tag = MAX_gen_N;
+			}
+		}
+	}
+}
+
+// Supplementation from captive population
+2: early() {
+	if(supMode=="Y"){
+		for (i in 1:(length(demo_file)-1)){
+			line=demo_file[i];
+			GEN=strsplit(line,"\t")[2];
+			GEN=asInteger(GEN)+asInteger(initGen)+(genBurnin-1);
+			Supplementation=asInteger(strsplit(line,"\t")[5]);
+			if(Supplementation>0 & sim.generation==GEN){
+				print(c(sim.generation,"Supplementation "," N= ",Supplementation));
+				Supplementation_indv=sortBy(p2.individuals, "age")[0:Supplementation];
+				p1.takeMigrants(Supplementation_indv);
+			}
+		}
+	}
+}
+
+
+
+//reproduction age restrictions + litter size - monogamous mating
+reproduction(p1) {
+	// randomize the order of p1.individuals
+	parents_age1plus=p1.individuals[p1.individuals.age>=2];
+	parents = sample(parents_age1plus, length(parents_age1plus));
+	// draw monogamous pairs and generate litters
+	if(length(parents)>=4){
+		for (i in seq(0, length(parents_age1plus) - 2, by=2))
+		{
+			parent1 = parents[i];
+			parent2 = parents[i + 1];
+			litterSize = sample(prob_litter,1);
+			for (j in 1:litterSize)
+			{
+				p1.addCrossed(parent1, parent2);
+			}
+		}
+	}
+	// disable this callback for this generation
+	self.active = 0;
+}
+
+// reproduction age restrictions + litter size + unralted indv - monogamous mating
+reproduction(p2) {
+	//// No managment besides relatdness
+	if(asInteger(mng_captive)==1 | asInteger(mng_captive)==2){
+		out_rep_line=mng_age(p2, 1, 4);
+		if(isNULL(out_rep_line)){midSize=ceil(p2.individualCount/2);out_rep_line=mng_random(p2, midSize, 4);}
+	}
+	// disable this callback for this generation and write output
+	if(supMode=="Y"){
+		writeFile(paste(c(outPref_in,"_p2_managment.txt"),sep=""),out_rep_line,append=T);
+	}
+	self.active = 0;
+}
+
+
+//// Fitness scalling regulated with a life table based individual mortality
+early() {
+	inds = p1.individuals;
+	ages = inds.age;
+	prob_mort=c(rnorm(1,0.54,0.05),sort(rnorm(12,0.148,0.06)),rnorm(1,0.5,0.05), rnorm(1,0.75,0.05), 1.0);
+	prob_mort[prob_mort<0]=0;
+	mortality = prob_mort[ages];
+	survival = 1 - mortality;
+	inds.fitnessScaling = survival;
+	// density-dependence, factoring in individual mortality
+	p1.fitnessScaling = p1.tag / (p1.individualCount * mean(survival));
+
+	if(length(sim.subpopulations)>1){
+		inds = p2.individuals;
+		ages = inds.age;
+		prob_mort2=c(rnorm(1,0.34,0.05),sort(rnorm(12,0.08,0.04)),rnorm(1,0.4,0.04), rnorm(1,0.6,0.04), 1.0);
+		prob_mort2[prob_mort2<0]=0;
+		mortality = prob_mort2[ages];
+		survival = 1 - mortality;
+		inds.fitnessScaling = survival;
+		// density-dependence, factoring in individual mortality
+		p2.fitnessScaling = p2.tag / (p2.individualCount * mean(survival));
+	}
+}
+
+
+1 early() {
+
+	OUT_line=c("gen" + "\t" + "year" + "\t" + "N"  + "\t" + "sampSize" + "\t" + "mLoad" + "\t" + "tHet"  + "\t" + "tHet_neutral" + "\t" + "indvFitness"+ "\t" + "ind_het" + "\t" + "ind_het_neutral" + "\t" + "IndvLoad");
+	writeFile(filePath=outPref_in+"_indvMetricsLite_p1.txt",contents=OUT_line,append=F);
+	writeFile(filePath=outPref_in+"_indvMetricsLite_p2.txt",contents=OUT_line,append=F);
+
+	OUT_line=c("gen" + "\t" + "year" + "\t" + "N"  + "\t" + "sampSize" + "\t" + "indvROH");
+	writeFile(filePath=outPref_in+"_ROH_p1.txt",contents=OUT_line,append=F);
+	writeFile(filePath=outPref_in+"_ROH_p2.txt",contents=OUT_line,append=F);
+
+
+}
+
+
+1: late() {
+	if(sim.generation < gen_y1773 & sim.generation % 100 == 0)
+	{
+		print(date() + "\t" + time() + "\t" + sim.generation+ "\t" + p1.individualCount + "\t" + mean(p1.individuals.countOfMutationsOfType(m2)));
+	}
+
+	if(
+		(sim.generation == gen_y1773) |
+		(sim.generation > gen_y1773 & sim.generation < gen_y1900 & sim.generation % 40 == 0) |
+		(sim.generation >= gen_y1900 & sim.generation < gen_y1970 & sim.generation % 10 == 0) |
+		(sim.generation >= gen_y1970 & sim.generation % 2 == 0) |
+		(sim.generation == LAST_gen_var)
+		) {
+
+		print("#### output: "+" gen= "+ sim.generation + " N= " + p1.individualCount);
+
+
+		GEN=sim.generation;
+		YEAR=FIRST_year + (GEN - FIRST_gen);
+		
+		out=indvMetrics_lite(p1,200);
+		out_line=GEN+ "\t" +YEAR+ "\t" +out;
+		writeFile(filePath=outPref_in+"_indvMetricsLite_p1.txt",contents=out_line,append=T);
+
+
+		if( length(sim.subpopulations) >1)
+		{
+
+			GEN=sim.generation;
+			YEAR=FIRST_year + (GEN - FIRST_gen);
+
+			out=indvMetrics_lite(p2,50);
+			out_line=GEN+ "\t" +YEAR+ "\t" +out;
+			writeFile(filePath=outPref_in+"_indvMetricsLite_p2.txt",contents=out_line,append=T);
+
+
+			out=mutSummary(p2,50);
+			out_line=GEN+ "\t" +YEAR+ "\t" +out;
+			writeFile(filePath=outPref_in+"_mutSummary_p2.txt",contents=out_line,append=T);
+
+		}
+
+	}
+}
+
+
+1: late() {
+	if(
+		(sim.generation == gen_y1773) |
+		(sim.generation > gen_y1773 & sim.generation < gen_y1900 & sim.generation % 100 == 0) |
+		(sim.generation >= gen_y1900 & sim.generation < gen_y1970 & sim.generation % 30 == 0) |
+		(sim.generation >= gen_y1970 & sim.generation % 40 == 0) |
+		(sim.generation == LAST_gen_var)
+		) {
+
+		print("#### output ROH: "+" gen= "+ sim.generation + " N= " + p1.individualCount);
+
+
+		GEN=sim.generation;
+		YEAR=FIRST_year + (GEN - FIRST_gen);
+
+		out=getROH(p1,50,1e6);
+		out_line=GEN+ "\t" +YEAR+ "\t" +out;
+		writeFile(filePath=outPref_in+"_ROH_p1.txt",contents=out_line,append=T);
+
+		if( length(sim.subpopulations) >1)
+		{
+
+			GEN=sim.generation;
+			YEAR=FIRST_year + (GEN - FIRST_gen);
+
+			out=getROH(p2,50,1e6);
+			out_line=GEN+ "\t" +YEAR+ "\t" +out;
+			writeFile(filePath=outPref_in+"_ROH_p2.txt",contents=out_line,append=T);
+
+		}
+
+	}
+}
+
+
+
+
+1: late() {
+	if(p1.individualCount<2){
+		print(c(date(),time(),"population collapsed at GEN=",sim.generation,"with N=",p1.individuals.size()));
+
+		GEN=sim.generation;
+		YEAR=FIRST_year + (GEN - FIRST_gen);
+
+
+		OUT_line=c(sim.generation + "\t" + YEAR + "\t" + "0"  + "\t" + "0"+ "\t" + "0"+ "\t" + "0" + "\t" + "0" + "\t" + "0"+ "\t" + "0" + "\t" + "0"+ "\t" + "0" + "\t" + "0" + "\t" + "0"+ "\t" + "0" + "\t" + "0" + "\t" + "0");
+
+		OUT_line=c("gen" + "\t" + "year" + "\t" + "0"  + "\t" + "0"+ "\t" + "0"+ "\t" + "0" + "\t" + "0" + "\t" + "0"+ "\t" + "0" + "\t" + "0" + "\t" + "0");
+		writeFile(filePath=outPref_in+"_indvMetricsLite_p1.txt",contents=OUT_line,append=T);
+		writeFile(filePath=outPref_in+"_indvMetricsLite_p2.txt",contents=OUT_line,append=T);
+
+
+		sim.simulationFinished();
+	}
+}
+
+
+s0 1000000 late() {
+	print(c(date(),time(),"simulation finished at GEN=",sim.generation,"with N=",p1.individuals.size()));
+	sim.simulationFinished();
+}
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+function (s) mng_age(o pop, i age, i minSize)
+{
+	sel_parents=pop.individuals[pop.individuals.age>=age];
+	if (length(sel_parents) >= minSize){
+		parents = sample(sel_parents, length(sel_parents));
+		// avoid relatdness
+		while(length(parents)>=2){
+			indv=sample(parents,1);
+			relat=indv.relatedness(parents);
+			MINrelat=min(relat);
+			if(MINrelat==0){NonRelatRnd=sample(parents[relat==0],1);};
+			if(MINrelat<=0.25){NonRelatRnd=sample(parents[relat<=0.25],1);};
+			if(MINrelat<0.5){NonRelatRnd=sample(parents[relat<0.5],1);};
+			if(MINrelat==0.5){break;};
+			parents=setSymmetricDifference(parents,c(indv,NonRelatRnd));
+			litterSize = sample(prob_litter,1);
+			//			print(c(paste(indv), paste(NonRelatRnd),paste(litterSize)));
+			for (j in 1:litterSize)
+			{
+				p2.addCrossed(indv, NonRelatRnd);
+			}
+		}
+		return(c(sim.generation + "\t" + mng_captive + "\t" + "mng_age" + "\t" + sel_parents.size() + "\t" + mean(sel_parents.genomes.countOfMutationsOfType(m2)) + "\t" + mean(sel_parents.genomes.mutationsOfType(2).selectionCoeff)));
+	} else {return(NULL);}
+}
+
+
+///////////////////////
+
+
+function (s) indvMetrics_lite(o pop, i sampSize)
+{
+	i=pop.sampleIndividuals(sampSize);
+
+	indvCount=length(i);
+	indvFitness=pop.cachedFitness(i.index);
+
+	ind_het = c();
+	ind_het_neutral = c();
+	IndvLoadM2_withFixed= c();
+
+	for (individual in i) {
+
+		muts0_m1=individual.genomes[0].mutationsOfType(m1);
+		muts1_m1=individual.genomes[1].mutationsOfType(m1);
+		muts0_m2=individual.genomes[0].mutationsOfType(m2);
+		muts1_m2=individual.genomes[1].mutationsOfType(m2);
+		muts0=c(muts0_m1,muts0_m2);
+		muts1=c(muts1_m1,muts1_m2);
+
+		if(length(muts0)+length(muts1)>0){
+			HOMO_m2=setIntersection(muts0_m2,muts1_m2);
+			HETERO_m2=setSymmetricDifference(muts0_m2,muts1_m2);
+			HOMO_m1=setIntersection(muts0_m1,muts1_m1);
+			HETERO_m1=setSymmetricDifference(muts0_m1,muts1_m1);
+			HOMO=setIntersection(muts0,muts1);
+			HETERO=setSymmetricDifference(muts0,muts1);
+		}
+
+
+		// Load
+		if(length(HOMO_m2)>0){
+			IndvLoadM2_homo=sum(HOMO_m2.selectionCoeff);
+		} else {IndvLoadM2_homo=0;}
+		if(length(HETERO_m2)>0){
+			IndvLoadM2_hetero=sum(HETERO_m2.selectionCoeff*HETERO_m2.getValue("dom"));
+		} else {IndvLoadM2_hetero=0;}
+		IndvLoadM2_i=IndvLoadM2_homo+IndvLoadM2_hetero;
+		IndvLoadM2_withFixed= c(IndvLoadM2_withFixed,IndvLoadM2_i);
+
+		ind_het=c(ind_het,length(HETERO)/ (sim.chromosome.lastPosition + 1));
+		ind_het_neutral=c(ind_het_neutral,length(HETERO_m1)/ (sim.chromosome.lastPosition + 1));
+	}
+
+	mLoad=mean(IndvLoadM2_withFixed);
+	tHet=sum(ind_het);
+	tHet_neutral=sum(ind_het_neutral);
+
+	return(pop.individualCount +"\t"+ indvCount +"\t"+ mLoad +"\t"+ tHet +"\t"+ tHet_neutral +"\t"+ paste(indvFitness,"_") +"\t"+paste(ind_het,"_")+"\t"+paste(ind_het_neutral,"_")+"\t"+paste(IndvLoadM2_withFixed,"_"));
+
+}
+
+function (s) getROH(o pop, i sampSize, i ROHcutoff)
+{
+
+	i=pop.sampleIndividuals(sampSize);
+	indvCount=length(i);
+
+	ind_ROH = c();
+	m = sortBy(i.genomes.mutations, "position"); //get all mutations in sample
+	m_uniq = unique(m); // get rid of redundant muts
+	DAF = sapply(m_uniq, "sum(m == applyValue);"); // count number of each mut in pop
+	m_uniq_polym = m_uniq[DAF != i.genomes.size()]; //remove fixed mutations??
+
+	for (individual in i) {
+
+		indm = sortBy(individual.genomes.mutations, "position");
+		indm = indm[match(indm, m_uniq_polym) >= 0];   // Check that individual mutations are not fixed
+		indm_uniq = unique(indm);
+
+		genotype = sapply(indm_uniq, "sum(indm == applyValue);");
+
+		if (isNULL(genotype)) {
+			ind_ROH = c(ind_ROH, "NA");
+			next;
+		}
+
+		//code for getting ROHs
+		ID_het = (genotype == 1); //outputs T/F for genotypes if they are het or homDer
+		ID_homDer = (genotype == 2);
+		pos_het = indm_uniq.position[ID_het]; //outputs positions of heterozgoys genotypes
+
+		startpos = c(0, pos_het); //adds 0 to beggining of vector of hets
+		endpos = c(pos_het, sim.chromosome.lastPosition); //adds last position in genome to vector of hets
+		pos_het_diff = endpos - startpos;
+		ROH_startpos = startpos[pos_het_diff > ROHcutoff]; //filter out startpos that dont correspond to ROH > ROH_length
+		ROH_endpos = endpos[pos_het_diff > ROHcutoff];
+		ROH_length = pos_het_diff[pos_het_diff > ROHcutoff]; //vector of ROHs for each individual
+		ROH_length_sum = sum(ROH_length);
+		ROH_out=ROH_length_sum/chromLen;
+		if(isNULL(ROH_out)){ROH_out = 0;}
+		ind_ROH = c(ind_ROH, ROH_out); // add sum of ROHs for each individual to vector of ROHs for all individuals
+	}
+
+	return(pop.individualCount +"\t"+ indvCount +"\t"+ paste(ind_ROH,"_"));
+
+}
